@@ -1,0 +1,919 @@
+import os
+import time
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")          
+                                
+import matplotlib.pyplot as plt
+
+from scipy.stats    import levy_stable
+from scipy.optimize import minimize, minimize_scalar
+from scipy.special  import expit
+
+warnings.filterwarnings("ignore")
+
+
+
+# OUTPUT DIRECTORY  ── change BASE_DIR to your own path
+
+
+BASE_DIR   = r"C:\Users\smrit\OneDrive\Desktop"
+OUTPUT_DIR = os.path.join(BASE_DIR, "MWS_Simulation_OUTPUTS")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print("=" * 62)
+print("  OUTPUT DIRECTORY:", OUTPUT_DIR)
+print("=" * 62)
+
+
+# GLOBAL SETTINGS
+
+np.random.seed(2025)
+
+SAMPLE_SIZES = [100, 200, 500, 1000]
+B_ITER       = 1000          
+N_FOURIER    = 25           
+K_CF         = 3            
+
+# True parameters
+TRUE_ALPHA   = 1.5
+TRUE_MU_1    = 0.5          # univariate location
+TRUE_GAMMA_1 = 1.0          # univariate dispersion
+
+TRUE_MU_BIV    = np.array([0.5, -0.3])   # bivariate location
+TRUE_GAMMA_BIV = np.array([1.0,  0.8])   # bivariate dispersions
+
+
+
+# SECTION 1 — HELPERS
+
+
+def wrap_angle(x):
+    """Wrap real array onto (-pi, pi]."""
+    return ((np.asarray(x, float) + np.pi) % (2.0 * np.pi)) - np.pi
+
+
+def circular_mean(theta):
+    """Circular (directional) mean."""
+    return float(np.angle(np.mean(np.exp(1j * np.asarray(theta, float)))))
+
+
+def _loglog_wols(phi_abs, ks):
+    """
+    Weighted OLS on the log-log moment equation:
+        log(-log|phi(k)|)  =  log(gamma)  +  alpha * log(k)
+    Returns (alpha_hat, gamma_hat).
+    """
+    phi_abs = np.clip(phi_abs, 1e-12, 1 - 1e-12)
+    y   = np.log(-np.log(phi_abs))
+    lk  = np.log(ks.astype(float))
+    wt  = phi_abs ** 2
+    wt /= wt.sum()
+    xm  = np.dot(wt, lk)
+    ym  = np.dot(wt, y)
+    b   = np.dot(wt, (lk - xm) * (y - ym)) / (np.dot(wt, (lk - xm) ** 2) + 1e-15)
+    a   = ym - b * xm
+    alpha_hat = float(np.clip(b, 0.30, 1.95))
+    gamma_hat = float(max(np.exp(a), 1e-4))
+    return alpha_hat, gamma_hat
+
+
+
+# SECTION 2 — UNIVARIATE MWS
+
+
+def r_mws1(n, alpha, mu, gamma):
+    """
+    Simulate n draws from MWS(alpha, mu, gamma) on T^1.
+    Uses scipy.stats.levy_stable (Nolan parameterisation S1).
+    scale = gamma^(1/alpha) maps the unit-stable to MWS dispersion gamma.
+    """
+    scale = gamma ** (1.0 / alpha)
+    s = levy_stable.rvs(alpha, beta=0, loc=mu, scale=scale, size=n)
+    return wrap_angle(s)
+
+
+def d_mws1(theta, alpha, mu, gamma, N=N_FOURIER):
+    """
+    MWS density at array theta via truncated Fourier series.
+      p(theta) = (1/2pi) Re[ sum_{k=-N}^{N} phi(k) exp(-i k theta) ]
+    where  phi(k) = exp(i k mu - gamma |k|^alpha).
+    """
+    theta = np.asarray(theta, float)
+    ks    = np.arange(-N, N + 1)
+    phi   = np.exp(1j * ks * mu - gamma * np.abs(ks) ** alpha)  # (2N+1,)
+    mat   = np.outer(ks, theta)                                   # (2N+1, n)
+    d     = np.real(np.sum(phi[:, None] * np.exp(-1j * mat), axis=0)) / (2 * np.pi)
+    return np.maximum(d, 1e-300)
+
+
+
+# SECTION 3 — UNIVARIATE ESTIMATORS
+
+
+#    3.1  Generalised Method of Moments-CF (GMM-CF) 
+def GMM_cf_mws1(theta):
+    """
+    MoM for MWS(alpha, mu, gamma).
+    alpha, gamma : from weighted OLS on log-log of empirical CF moduli
+    mu           : circular mean
+    """
+    theta   = np.asarray(theta, float)
+    ks      = np.arange(1, K_CF + 1)
+    phi_abs = np.array([np.abs(np.mean(np.exp(1j * k * theta))) for k in ks])
+    alpha_hat, gamma_hat = _loglog_wols(phi_abs, ks)
+    mu_hat = circular_mean(theta)
+    return np.array([alpha_hat, mu_hat, gamma_hat])
+
+
+#  3.2  CF Minimum Distance Estimator (CF-MDE) 
+def cf_mde_mws1(theta):
+    """
+    CF-MDE: minimise distance between empirical and theoretical CF.
+    For symmetric stable distributions, the modulus equation decouples:
+      |phi_hat(k)| ≈ exp(-gamma k^alpha)
+    so the estimator reduces to weighted OLS on log-log moduli.
+    mu is recovered from the argument of phi_hat(1).
+    """
+    theta   = np.asarray(theta, float)
+    ks      = np.arange(1, K_CF + 1)
+    phi_hat = np.array([np.mean(np.exp(1j * k * theta)) for k in ks])
+    phi_abs = np.clip(np.abs(phi_hat), 1e-12, 1 - 1e-12)
+    alpha_hat, gamma_hat = _loglog_wols(phi_abs, ks)
+    mu_hat = float(np.angle(phi_hat[0]))    
+    return np.array([alpha_hat, mu_hat, gamma_hat])
+
+
+#  3.3  Maximum Likelihood Estimator (MLE) 
+def mle_mws1(theta, init=None, N=N_FOURIER):
+    """
+    MLE via Nelder-Mead.  Parameters are reparameterised for unconstrained
+    optimisation:
+        q[0] = logit((alpha - 0.1) / 1.9)   → alpha in (0.1, 2.0)
+        q[1] = mu                             → unconstrained angle
+        q[2] = log(gamma)                     → gamma > 0
+    Initialised with MoM estimates.
+    """
+    theta = np.asarray(theta, float)
+    if init is None:
+        init = GMM_cf_mws1(theta)           
+
+    def itr(q):
+        """Inverse transform: unconstrained → natural parameters."""
+        return np.array([0.1 + 1.9 * float(expit(q[0])), float(q[1]), float(np.exp(q[2]))])
+
+    def tr(p):
+        """Forward transform: natural → unconstrained."""
+        return np.array([np.log((p[0] - 0.1) / (2.0 - p[0])), p[1], np.log(p[2])])
+
+    def neg_ll(q):
+        p = itr(q)
+        if abs(p[0] - 1.0) < 0.05:      
+            return 1e8
+        return -float(np.sum(np.log(d_mws1(theta, p[0], p[1], p[2], N=N))))
+
+    q0  = tr(init)
+    res = minimize(neg_ll, q0, method="Nelder-Mead",
+                   options={"maxiter": 3000, "xatol": 1e-5, "fatol": 1e-5})
+    p   = itr(res.x)
+    return np.array([p[0], wrap_angle(p[1]), p[2]])
+
+
+#  3.4  EM Algorithm 
+def em_mws1(theta, max_iter=80, tol=1e-5, init=None):
+    """
+    Scale-mixture EM for univariate MWS.
+    E-step : approximate E[V_i | theta_i] via Fourier weights.
+    M-step : update mu (circular mean), gamma (CF matching),
+             alpha (1-D profile likelihood optimisation).
+    """
+    theta = np.asarray(theta, float)
+    if init is None:
+        init = GMM_cf_mws1(theta)
+    alpha, mu, gamma = float(init[0]), float(init[1]), float(init[2])
+
+    def _ev(t_i, alp, m, g, N=15):
+        """Approximate conditional expectation E[V | theta_i]."""
+        ks  = np.concatenate([np.arange(-N, 0), np.arange(1, N + 1)])
+        phi = np.exp(1j * ks * m - g * np.abs(ks) ** alp)
+        lam = alp / (np.abs(ks) ** alp * g + 1e-15)
+        ei  = np.exp(-1j * ks * t_i)
+        num = float(np.real(np.sum(lam * phi * ei)))
+        den = float(np.real(np.sum(phi * ei))) + 1.0 / (2 * np.pi)
+        return max(num / (den + 1e-15), 0.01)
+
+    prev_ll = -np.inf
+    for _ in range(max_iter):
+
+        # E-step
+        vt = np.array([_ev(t, alpha, mu, gamma) for t in theta])
+        vt = np.clip(vt, 0.01, None)
+
+        # M-step  mu
+        mu = circular_mean(theta)
+
+        # M-step  gamma  (CF moment at k=1)
+        phi1  = float(np.abs(np.mean(np.exp(1j * theta))))
+        phi1  = max(phi1, 1e-10)
+        gamma = max(-np.log(phi1) / (1.0 ** alpha), 1e-4)
+
+        # M-step  alpha  (1-D profile)
+        def _neg_prof(a):
+            if a <= 0.10 or a >= 1.95 or abs(a - 1.0) < 0.05:
+                return 1e8
+            return -float(np.sum(np.log(d_mws1(theta, a, mu, gamma, N=15))))
+
+        res_a = minimize_scalar(_neg_prof, bounds=(0.2, 1.95), method="bounded")
+        alpha = float(res_a.x)
+
+        curr_ll = -_neg_prof(alpha)
+        if abs(curr_ll - prev_ll) < tol:
+            break
+        prev_ll = curr_ll
+
+    return np.array([alpha, wrap_angle(mu), gamma])
+
+
+#  3.5  Nested EM 
+def nested_em_mws1(theta, max_outer=30, tol=1e-5, init=None):
+    """
+    Nested EM for univariate MWS.
+    Outer loop: profile over alpha via Brent search.
+    Inner loop: given alpha, update (mu, gamma) by closed-form EM steps.
+    Initialised from MoM — NOT a recursive self-call.
+    """
+    theta = np.asarray(theta, float)
+    if init is None:
+        init = GMM_cf_mws1(theta)           
+    alpha, mu, gamma = float(init[0]), float(init[1]), float(init[2])
+
+    def _inner(a):
+        """Given alpha, return updated (mu, gamma) by CF matching."""
+        m = circular_mean(theta)
+        phis = np.array([
+            max(float(np.abs(np.mean(np.exp(1j * k * theta)))), 1e-10)
+            for k in range(1, K_CF + 1)
+        ])
+        g = max(float(np.mean(-np.log(phis) / np.arange(1, K_CF + 1) ** a)), 1e-4)
+        return m, g
+
+    prev_ll = -np.inf
+    for _ in range(max_outer):
+
+        def _neg_profile(a):
+            if a <= 0.15 or a >= 1.95 or abs(a - 1.0) < 0.05:
+                return 1e8
+            m, g = _inner(a)
+            return -float(np.sum(np.log(d_mws1(theta, a, m, g, N=15))))
+
+        res_a = minimize_scalar(_neg_profile, bounds=(0.2, 1.95), method="bounded")
+        alpha = float(res_a.x)
+        mu, gamma = _inner(alpha)
+
+        curr_ll = float(np.sum(np.log(d_mws1(theta, alpha, mu, gamma, N=15))))
+        if abs(curr_ll - prev_ll) < tol:
+            break
+        prev_ll = curr_ll
+
+    return np.array([alpha, wrap_angle(mu), gamma])
+
+
+
+# SECTION 4 — BIVARIATE MWS  (diagonal spectral measure)
+
+
+def r_mws2(n, alpha, mu, gamma_vec):
+    """
+    Simulate n bivariate MWS samples under diagonal spectral measure.
+    Returns (n, 2) array.
+    """
+    T1 = r_mws1(n, alpha, float(mu[0]), float(gamma_vec[0]))
+    T2 = r_mws1(n, alpha, float(mu[1]), float(gamma_vec[1]))
+    return np.column_stack([T1, T2])
+
+
+def d_mws2(Theta, alpha, mu, gamma_vec, N=N_FOURIER):
+    """
+    Bivariate MWS density: product of two marginal densities.
+    """
+    d1 = d_mws1(Theta[:, 0], alpha, float(mu[0]), float(gamma_vec[0]), N=N)
+    d2 = d_mws1(Theta[:, 1], alpha, float(mu[1]), float(gamma_vec[1]), N=N)
+    return d1 * d2
+
+
+
+# SECTION 5 — BIVARIATE ESTIMATORS
+
+
+def _biv_loglog(Theta):
+    """
+    Shared helper: pooled log-log OLS over both marginals and k=1..K_CF.
+    Returns (alpha_hat, mu1, mu2, gamma1, gamma2).
+    """
+    ks  = np.arange(1, K_CF + 1)
+    pa1 = np.array([max(np.abs(np.mean(np.exp(1j * k * Theta[:, 0]))), 1e-10) for k in ks])
+    pa2 = np.array([max(np.abs(np.mean(np.exp(1j * k * Theta[:, 1]))), 1e-10) for k in ks])
+    pa1 = np.clip(pa1, 1e-10, 1 - 1e-10)
+    pa2 = np.clip(pa2, 1e-10, 1 - 1e-10)
+
+    # Pooled alpha
+    y   = np.concatenate([np.log(-np.log(pa1)), np.log(-np.log(pa2))])
+    lk  = np.tile(np.log(ks.astype(float)), 2)
+    wt  = np.concatenate([pa1 ** 2, pa2 ** 2])
+    wt /= wt.sum()
+    xm  = np.dot(wt, lk);  ym = np.dot(wt, y)
+    b   = np.dot(wt, (lk - xm) * (y - ym)) / (np.dot(wt, (lk - xm) ** 2) + 1e-15)
+    alpha_hat = float(np.clip(b, 0.30, 1.95))
+
+    # Marginal gammas
+    _, g1 = _loglog_wols(pa1, ks)
+    _, g2 = _loglog_wols(pa2, ks)
+
+    mu1 = circular_mean(Theta[:, 0])
+    mu2 = circular_mean(Theta[:, 1])
+    return alpha_hat, mu1, mu2, g1, g2
+
+
+#  5.1  Bivariate GMM-CF 
+def GMM_cf_mws2(Theta):
+    a, m1, m2, g1, g2 = _biv_loglog(Theta)
+    return np.array([a, m1, m2, g1, g2])
+
+
+# 5.2  Bivariate CF-MDE 
+def cf_mde_mws2(Theta):
+    """Same log-log structure as MoM for diagonal Gamma."""
+    return GMM_cf_mws2(Theta)
+
+
+#  5.3  Bivariate MLE 
+def mle_mws2(Theta, init=None, N=N_FOURIER):
+    """
+    MLE for bivariate MWS (diagonal Gamma) via Nelder-Mead.
+    Parameters: (alpha, mu1, mu2, gamma1, gamma2).
+    """
+    if init is None:
+        init = GMM_cf_mws2(Theta)
+
+    def itr(q):
+        return np.array([
+            0.1 + 1.9 * float(expit(q[0])),
+            float(q[1]),
+            float(q[2]),
+            float(np.exp(q[3])),
+            float(np.exp(q[4]))
+        ])
+
+    def tr(p):
+        return np.array([
+            np.log((p[0] - 0.1) / (2.0 - p[0])),
+            p[1], p[2],
+            np.log(p[3]),
+            np.log(p[4])
+        ])
+
+    def neg_ll(q):
+        p = itr(q)
+        if abs(p[0] - 1.0) < 0.05:
+            return 1e8
+        d = d_mws2(Theta, p[0], p[1:3], p[3:5], N=N)
+        return -float(np.sum(np.log(d)))
+
+    res = minimize(neg_ll, tr(init), method="Nelder-Mead",
+                   options={"maxiter": 5000, "xatol": 1e-5, "fatol": 1e-5})
+    p = itr(res.x)
+    return np.array([p[0], wrap_angle(p[1]), wrap_angle(p[2]), p[3], p[4]])
+
+
+#  5.4  Bivariate EM 
+def em_mws2(Theta, max_iter=60, tol=1e-5, init=None):
+    """
+    EM for bivariate MWS (diagonal Gamma).
+    M-step for mu is the componentwise circular mean.
+    M-step for gamma is CF matching per component.
+    M-step for alpha is a joint 1-D profile likelihood.
+    """
+    if init is None:
+        init = GMM_cf_mws2(Theta)
+    alpha  = float(init[0])
+    mu     = np.array([float(init[1]), float(init[2])])
+    gamma  = np.array([float(init[3]), float(init[4])])
+
+    prev_ll = -np.inf
+    for _ in range(max_iter):
+
+        # M-step  mu
+        mu[0] = circular_mean(Theta[:, 0])
+        mu[1] = circular_mean(Theta[:, 1])
+
+        # M-step  gamma
+        for j in range(2):
+            phis = np.array([
+                max(float(np.abs(np.mean(np.exp(1j * k * Theta[:, j])))), 1e-10)
+                for k in range(1, K_CF + 1)
+            ])
+            gamma[j] = max(float(np.mean(-np.log(phis) / np.arange(1, K_CF + 1) ** alpha)), 1e-4)
+
+        # M-step  alpha  (joint profile)
+        def _neg_joint(a):
+            if a <= 0.15 or a >= 1.95 or abs(a - 1.0) < 0.05:
+                return 1e8
+            return -float(np.sum(np.log(d_mws2(Theta, a, mu, gamma, N=15))))
+
+        res_a = minimize_scalar(_neg_joint, bounds=(0.2, 1.95), method="bounded")
+        alpha = float(res_a.x)
+
+        curr_ll = -_neg_joint(alpha)
+        if abs(curr_ll - prev_ll) < tol:
+            break
+        prev_ll = curr_ll
+
+    return np.array([alpha, wrap_angle(mu[0]), wrap_angle(mu[1]), gamma[0], gamma[1]])
+
+
+#  5.5  Bivariate Nested EM 
+def nested_em_mws2(Theta, max_outer=25, tol=1e-5, init=None):
+    """
+    Nested EM for bivariate MWS.
+    Outer loop: profile over alpha.
+    Inner step: closed-form updates for (mu, gamma) given alpha.
+    """
+    if init is None:
+        init = GMM_cf_mws2(Theta)
+    alpha  = float(init[0])
+    mu     = np.array([float(init[1]), float(init[2])])
+    gamma  = np.array([float(init[3]), float(init[4])])
+
+    def _inner(a):
+        m = np.array([circular_mean(Theta[:, 0]), circular_mean(Theta[:, 1])])
+        g = np.zeros(2)
+        for j in range(2):
+            phis = np.array([
+                max(float(np.abs(np.mean(np.exp(1j * k * Theta[:, j])))), 1e-10)
+                for k in range(1, K_CF + 1)
+            ])
+            g[j] = max(float(np.mean(-np.log(phis) / np.arange(1, K_CF + 1) ** a)), 1e-4)
+        return m, g
+
+    prev_ll = -np.inf
+    for _ in range(max_outer):
+
+        def _neg_profile(a):
+            if a <= 0.15 or a >= 1.95 or abs(a - 1.0) < 0.05:
+                return 1e8
+            m, g = _inner(a)
+            return -float(np.sum(np.log(d_mws2(Theta, a, m, g, N=15))))
+
+        res_a = minimize_scalar(_neg_profile, bounds=(0.2, 1.95), method="bounded")
+        alpha = float(res_a.x)
+        mu, gamma = _inner(alpha)
+
+        curr_ll = -_neg_profile(alpha)
+        if abs(curr_ll - prev_ll) < tol:
+            break
+        prev_ll = curr_ll
+
+    return np.array([alpha, wrap_angle(mu[0]), wrap_angle(mu[1]), gamma[0], gamma[1]])
+
+
+
+# SECTION 6 — BIAS / RMSE HELPER
+
+
+def compute_bias_rmse(estimates, true_val):
+    """Return (bias, RMSE) for a 1-D array of estimates."""
+    estimates = np.asarray(estimates, float)
+    estimates = estimates[np.isfinite(estimates)]
+    if len(estimates) == 0:
+        return np.nan, np.nan
+    bias = float(np.mean(estimates) - true_val)
+    rmse = float(np.sqrt(np.mean((estimates - true_val) ** 2)))
+    return bias, rmse
+
+
+
+# SECTION 7 — MONTE CARLO: UNIVARIATE
+
+
+def run_mc_univariate(
+    n,
+    B=B_ITER,
+    true_alpha=TRUE_ALPHA,
+    true_mu=TRUE_MU_1,
+    true_gamma=TRUE_GAMMA_1
+):
+    """
+    Run B replications of the 5 univariate estimators for sample size n.
+    Returns a DataFrame with columns:
+        Dimension | n | Method | Parameter | Bias | RMSE
+    """
+    print(f"\n  [Univariate] n={n}, B={B}", flush=True)
+    t0 = time.time()
+
+    # Storage: method → list of (alpha_hat, mu_hat, gamma_hat)
+    store = {m: [] for m in ["GMM_cf", "CF_MDE", "MLE", "EM", "NEM"]}
+
+    for b in range(B):
+        theta = r_mws1(n, true_alpha, true_mu, true_gamma)
+
+        # Shared init from MoM
+        try:
+            init = GMM_cf_mws1(theta)
+        except Exception:
+            init = np.array([1.5, 0.5, 1.0])
+
+        # GMM-cf
+        try:
+            store["GMM_cf"].append(GMM_cf_mws1(theta))
+        except Exception:
+            store["GMM_Cf"].append(np.full(3, np.nan))
+
+        # CF-MDE
+        try:
+            store["CF_MDE"].append(cf_mde_mws1(theta))
+        except Exception:
+            store["CF_MDE"].append(np.full(3, np.nan))
+
+        # MLE
+        try:
+            store["MLE"].append(mle_mws1(theta, init=init))
+        except Exception:
+            store["MLE"].append(np.full(3, np.nan))
+
+        # EM
+        try:
+            store["EM"].append(em_mws1(theta, init=init))
+        except Exception:
+            store["EM"].append(np.full(3, np.nan))
+
+        # Nested EM
+        try:
+            store["NEM"].append(nested_em_mws1(theta, init=init))
+        except Exception:
+            store["NEM"].append(np.full(3, np.nan))
+
+    params    = ["alpha", "mu", "gamma"]
+    true_vals = [true_alpha, true_mu, true_gamma]
+    rows = []
+
+    for method_key, method_label in [
+        ("GMM_cf", "GMM-cf"), ("CF_MDE", "CF-MDE"),
+        ("MLE", "MLE"), ("EM",  "EM"), ("NEM", "Nested-EM")
+    ]:
+        arr = np.array(store[method_key])            # (B, 3)
+        for i, (param, tv) in enumerate(zip(params, true_vals)):
+            bias, rmse = compute_bias_rmse(arr[:, i], tv)
+            rows.append({
+                "Dimension": "Univariate",
+                "n":         n,
+                "Method":    method_label,
+                "Parameter": param,
+                "Bias":      bias,
+                "RMSE":      rmse
+            })
+
+    print(f"     done in {time.time() - t0:.1f}s", flush=True)
+    return pd.DataFrame(rows)
+
+
+
+# SECTION 8 — MONTE CARLO: BIVARIATE
+
+
+def run_mc_bivariate(
+    n,
+    B=B_ITER,
+    true_alpha=TRUE_ALPHA,
+    true_mu=TRUE_MU_BIV,
+    true_gamma=TRUE_GAMMA_BIV
+):
+    """
+    Run B replications of the 5 bivariate estimators for sample size n.
+    Parameters per replication: (alpha, mu1, mu2, gamma1, gamma2).
+    Returns a DataFrame with columns:
+        Dimension | n | Method | Parameter | Bias | RMSE
+    """
+    print(f"\n  [Bivariate]  n={n}, B={B}", flush=True)
+    t0 = time.time()
+
+    store = {m: [] for m in ["GMM_cf", "CF_MDE", "MLE", "EM", "NEM"]}
+
+    for b in range(B):
+        Theta = r_mws2(n, true_alpha, true_mu, true_gamma)
+
+        try:
+            init = GMM_cf_mws2(Theta)
+        except Exception:
+            init = np.array([1.5, 0.5, -0.3, 1.0, 0.8])
+
+        for key, fn in [
+            ("GMM_cf",    lambda: GMM_cf_mws2(Theta)),
+            ("CF_MDE", lambda: cf_mde_mws2(Theta)),
+            ("MLE",    lambda: mle_mws2(Theta, init=init)),
+            ("EM",     lambda: em_mws2(Theta, init=init)),
+            ("NEM",    lambda: nested_em_mws2(Theta, init=init)),
+        ]:
+            try:
+                store[key].append(fn())
+            except Exception:
+                store[key].append(np.full(5, np.nan))
+
+    params    = ["alpha", "mu1", "mu2", "gamma1", "gamma2"]
+    true_vals = [true_alpha, true_mu[0], true_mu[1], true_gamma[0], true_gamma[1]]
+    rows = []
+
+    for method_key, method_label in [
+        ("GMM_cf", "GMM-cf"), ("CF_MDE", "CF-MDE"),
+        ("MLE", "MLE"), ("EM",  "EM"), ("NEM", "Nested-EM")
+    ]:
+        arr = np.array(store[method_key])            # (B, 5)
+        for i, (param, tv) in enumerate(zip(params, true_vals)):
+            bias, rmse = compute_bias_rmse(arr[:, i], tv)
+            rows.append({
+                "Dimension": "Bivariate",
+                "n":         n,
+                "Method":    method_label,
+                "Parameter": param,
+                "Bias":      bias,
+                "RMSE":      rmse
+            })
+
+    print(f"     done in {time.time() - t0:.1f}s", flush=True)
+    return pd.DataFrame(rows)
+
+
+
+# SECTION 9 — RUN ALL SIMULATIONS
+
+
+print("\n" + "=" * 62)
+print("  UNIVARIATE MWS MONTE CARLO SIMULATION")
+print(f"  True: alpha={TRUE_ALPHA}, mu={TRUE_MU_1}, gamma={TRUE_GAMMA_1}")
+print("=" * 62)
+
+uni_frames = [run_mc_univariate(n) for n in SAMPLE_SIZES]
+results_uni = pd.concat(uni_frames, ignore_index=True)
+
+print("\n" + "=" * 62)
+print("  BIVARIATE MWS MONTE CARLO SIMULATION")
+print(f"  True: alpha={TRUE_ALPHA}, mu={TRUE_MU_BIV}, gamma={TRUE_GAMMA_BIV}")
+print("=" * 62)
+
+biv_frames = [run_mc_bivariate(n) for n in SAMPLE_SIZES]
+results_biv = pd.concat(biv_frames, ignore_index=True)
+
+results_all = pd.concat([results_uni, results_biv], ignore_index=True)
+
+csv_path = os.path.join(OUTPUT_DIR, "mws_mc_results.csv")
+results_all.to_csv(csv_path, index=False)
+print(f"\nSaved CSV: {csv_path}")
+
+
+
+# SECTION 10 — PLOTTING
+
+
+# Colour 
+METHOD_COLS = {
+    "GMM-cf":       "#E07B39",
+    "CF-MDE":    "#4A90D9",
+    "MLE":       "#27AE60",
+    "EM":        "#8E44AD",
+    "Nested-EM": "#C0392B",
+}
+METHOD_MARKS = {
+    "GMM-cf": "s", "CF-MDE": "o", "MLE": "^", "EM": "D", "Nested-EM": "*"
+}
+
+BG_COL = "#faf8f2"
+
+
+def _style_ax(ax, title="", xlabel="Sample size (n)", ylabel=""):
+    ax.set_facecolor("white")
+    ax.set_title(title, fontsize=10, fontweight="bold", pad=5)
+    ax.set_xlabel(xlabel, fontsize=8)
+    ax.set_ylabel(ylabel, fontsize=8)
+    ax.tick_params(labelsize=7)
+    ax.grid(axis="y", color="#e0e0e0", lw=0.5)
+    ax.spines[["top", "right"]].set_visible(False)
+
+
+#  10.1  Per-parameter Bias & RMSE plots (one file per dimension) 
+def save_bias_rmse_plots(df, dimension, param_labels, file_prefix):
+    """
+    One combined figure per dimension:
+      rows = [Bias, RMSE],  cols = parameters
+    """
+    params  = list(param_labels.keys())
+    methods = list(METHOD_COLS.keys())
+    ns_str  = [str(n) for n in SAMPLE_SIZES]
+
+    ncols = len(params)
+    fig, axes = plt.subplots(2, ncols,
+                             figsize=(3.2 * ncols, 7.5),
+                             facecolor=BG_COL)
+    fig.suptitle(f"{dimension} MWS — Bias & RMSE  (B={B_ITER} reps)",
+                 fontsize=12, fontweight="bold", y=1.00)
+
+    for row, metric in enumerate(["Bias", "RMSE"]):
+        for col, p in enumerate(params):
+            ax  = axes[row, col]
+            sub = df[(df["Dimension"] == dimension) & (df["Parameter"] == p)]
+            for m in methods:
+                mv = sub[sub["Method"] == m].sort_values("n")
+                ax.plot(ns_str, mv[metric].values,
+                        color=METHOD_COLS[m], marker=METHOD_MARKS[m],
+                        lw=1.6, ms=5, label=m)
+            if metric == "Bias":
+                ax.axhline(0, color="#888", lw=0.8, ls="--")
+            _style_ax(ax,
+                      title=param_labels[p],
+                      xlabel="n" if row == 1 else "",
+                      ylabel=metric if col == 0 else "")
+            if row == 0 and col == 0:
+                ax.legend(fontsize=7, framealpha=0.8, loc="best")
+
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    path = os.path.join(OUTPUT_DIR, f"{file_prefix}_bias_rmse.png")
+    plt.savefig(path, dpi=160, bbox_inches="tight", facecolor=BG_COL)
+    plt.close()
+    print(f"  Saved: {os.path.basename(path)}")
+
+
+param_labels_uni = {
+    "alpha": "Stability α",
+    "mu":    "Location μ",
+    "gamma": "Dispersion γ",
+}
+param_labels_biv = {
+    "alpha":  "Stability α",
+    "mu1":    "Location μ₁",
+    "mu2":    "Location μ₂",
+    "gamma1": "Dispersion γ₁",
+    "gamma2": "Dispersion γ₂",
+}
+
+save_bias_rmse_plots(results_all, "Univariate", param_labels_uni, "mws_uni")
+save_bias_rmse_plots(results_all, "Bivariate",  param_labels_biv, "mws_biv")
+
+
+#  10.2  Alpha comparison: Univariate vs Bivariate 
+def save_alpha_comparison(df):
+    dims    = ["Univariate", "Bivariate"]
+    methods = list(METHOD_COLS.keys())
+    ns_str  = [str(n) for n in SAMPLE_SIZES]
+
+    fig, axes = plt.subplots(2, 2, figsize=(11, 7.5), facecolor=BG_COL)
+    fig.suptitle("Stability Index α — Bias & RMSE: Univariate vs Bivariate",
+                 fontsize=12, fontweight="bold", y=1.00)
+
+    for col, dim in enumerate(dims):
+        sub = df[(df["Dimension"] == dim) & (df["Parameter"] == "alpha")]
+        for row, metric in enumerate(["Bias", "RMSE"]):
+            ax = axes[row, col]
+            for m in methods:
+                mv = sub[sub["Method"] == m].sort_values("n")
+                ax.plot(ns_str, mv[metric].values,
+                        color=METHOD_COLS[m], marker=METHOD_MARKS[m],
+                        lw=1.6, ms=5.5, label=m)
+            if metric == "Bias":
+                ax.axhline(0, color="#888", lw=0.8, ls="--")
+            _style_ax(ax,
+                      title=dim if row == 0 else "",
+                      xlabel="n" if row == 1 else "",
+                      ylabel=metric if col == 0 else "")
+            if row == 0 and col == 0:
+                ax.legend(fontsize=7.5, framealpha=0.8)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    path = os.path.join(OUTPUT_DIR, "mws_alpha_comparison.png")
+    plt.savefig(path, dpi=160, bbox_inches="tight", facecolor=BG_COL)
+    plt.close()
+    print(f"  Saved: {os.path.basename(path)}")
+
+
+save_alpha_comparison(results_all)
+
+
+# 10.3  RMSE heatmaps
+def save_rmse_heatmap(df, dimension, title, filename):
+    sub     = df[df["Dimension"] == dimension]
+    params  = list(sub["Parameter"].unique())
+    methods = list(METHOD_COLS.keys())[::-1]
+    ns_num  = SAMPLE_SIZES
+    n_labels = [f"n={n}" for n in ns_num]
+
+    fig, axes = plt.subplots(1, len(params),
+                              figsize=(3.4 * len(params), 2.6 + 0.3 * len(methods)),
+                              facecolor=BG_COL)
+    if len(params) == 1:
+        axes = [axes]
+    fig.suptitle(title, fontsize=11, fontweight="bold", y=1.02)
+
+    for ax, p in zip(axes, params):
+        mat = np.full((len(methods), len(ns_num)), np.nan)
+        for i, m in enumerate(methods):
+            for j, n in enumerate(ns_num):
+                v = sub[(sub["Method"] == m) & (sub["n"] == n) & (sub["Parameter"] == p)]["RMSE"]
+                if len(v):
+                    mat[i, j] = float(v.values[0])
+
+        vmin, vmax = np.nanmin(mat), np.nanmax(mat)
+        im = ax.imshow(mat, aspect="auto", cmap="RdYlGn_r", vmin=vmin, vmax=vmax)
+        for i in range(len(methods)):
+            for j in range(len(ns_num)):
+                ax.text(j, i, f"{mat[i, j]:.3f}", ha="center", va="center",
+                        fontsize=7.5, color="white", fontweight="bold")
+        ax.set_xticks(range(len(ns_num)));    ax.set_xticklabels(n_labels, fontsize=8)
+        ax.set_yticks(range(len(methods)));   ax.set_yticklabels(methods, fontsize=8,
+                                                                   fontweight="bold")
+        ax.set_title(p, fontsize=9, fontweight="bold", pad=4)
+        plt.colorbar(im, ax=ax, fraction=0.04, pad=0.04).ax.tick_params(labelsize=7)
+
+    plt.tight_layout()
+    path = os.path.join(OUTPUT_DIR, filename)
+    plt.savefig(path, dpi=160, bbox_inches="tight", facecolor=BG_COL)
+    plt.close()
+    print(f"  Saved: {os.path.basename(path)}")
+
+
+save_rmse_heatmap(results_all, "Univariate",
+                  "Univariate MWS — RMSE Heatmap",
+                  "mws_rmse_heatmap_uni.png")
+
+save_rmse_heatmap(results_all, "Bivariate",
+                  "Bivariate MWS — RMSE Heatmap",
+                  "mws_rmse_heatmap_biv.png")
+
+
+# 10.4  Individual Bias / RMSE per parameter (original-style plots) 
+for dim_label, param_dict in [
+    ("Univariate", param_labels_uni),
+    ("Bivariate",  param_labels_biv),
+]:
+    sub_dim = results_all[results_all["Dimension"] == dim_label]
+    for param, plabel in param_dict.items():
+        dfp = sub_dim[sub_dim["Parameter"] == param]
+        for metric in ["Bias", "RMSE"]:
+            fig, ax = plt.subplots(figsize=(8, 5), facecolor=BG_COL)
+            ax.set_facecolor("white")
+            for m in list(METHOD_COLS.keys()):
+                d = dfp[dfp["Method"] == m].sort_values("n")
+                ax.plot(d["n"].astype(str), d[metric].values,
+                        marker=METHOD_MARKS[m],
+                        color=METHOD_COLS[m],
+                        lw=1.8, ms=6, label=m)
+            if metric == "Bias":
+                ax.axhline(0, linestyle="--", color="#888", lw=0.8)
+            ax.set_xlabel("Sample Size (n)", fontsize=10)
+            ax.set_ylabel(metric, fontsize=10)
+            ax.set_title(f"{dim_label} MWS — {metric}: {plabel}", fontsize=11,
+                         fontweight="bold")
+            ax.legend(fontsize=9, framealpha=0.8)
+            ax.grid(True, axis="y", color="#e0e0e0", lw=0.5)
+            ax.spines[["top", "right"]].set_visible(False)
+            plt.tight_layout()
+            fname = f"{dim_label.lower()}_{metric.lower()}_{param}.png"
+            plt.savefig(os.path.join(OUTPUT_DIR, fname), dpi=160,
+                        bbox_inches="tight", facecolor=BG_COL)
+            plt.close()
+
+
+print("\n  Individual parameter plots saved.")
+
+
+
+# SECTION 11 — SUMMARY CONSOLE TABLE
+
+print("\n" + "=" * 62)
+print("  SUMMARY: Bias | RMSE for stability index α")
+print("=" * 62)
+
+tbl = (
+    results_all[results_all["Parameter"] == "alpha"]
+    [["Dimension", "n", "Method", "Bias", "RMSE"]]
+    .sort_values(["Dimension", "n", "Method"])
+    .assign(Bias=lambda d: d["Bias"].round(4),
+            RMSE=lambda d: d["RMSE"].round(4))
+)
+print(tbl.to_string(index=False))
+
+print("\n" + "=" * 62)
+print("  ALL OUTPUT FILES SAVED TO:")
+print(f"  {OUTPUT_DIR}")
+print("=" * 62)
+print("  mws_mc_results.csv")
+print("  mws_uni_bias_rmse.png")
+print("  mws_biv_bias_rmse.png")
+print("  mws_alpha_comparison.png")
+print("  mws_rmse_heatmap_uni.png")
+print("  mws_rmse_heatmap_biv.png")
+print("  univariate_bias_<param>.png  (×3)")
+print("  univariate_rmse_<param>.png  (×3)")
+print("  bivariate_bias_<param>.png   (×5)")
+print("  bivariate_rmse_<param>.png   (×5)")
+print("=" * 62)
+print("\n  SIMULATION COMPLETED SUCCESSFULLY")
