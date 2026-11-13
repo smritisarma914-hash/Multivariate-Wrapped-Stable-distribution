@@ -8,6 +8,9 @@ import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
+import itertools
+from scipy.special import logsumexp
+from scipy.linalg import solve_triangular
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 from scipy.optimize import minimize, minimize_scalar
@@ -1195,4 +1198,381 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
+    
+    
+    
+# ============================================================================= COMPARISON
+K_CMP      = 160          # Fourier terms used for the MWS density in this section
+CMP_NFIT   = 100_000      # importance-sampling points while fitting MGvM-full (d > 2)
+CMP_NFINAL = 1_000_000    # fresh points for the final normalising constant (d > 2)
+CMP_MAXITER = 500         # L-BFGS iterations for MGvM-full
+CMP_MIN_ESS = 0.01        # MGvM-full (d > 2) is reported only if importance-sampling ESS >= 1% of draws
+TWO_PI = 2 * np.pi
+ 
+ 
+def wrap_angles(a):
+    """wrap an array of angles to [-pi, pi)"""
+    return (np.asarray(a, float) + np.pi) % TWO_PI - np.pi
+ 
+ 
+def _cmp_circ_init(data):
+    mu = np.arctan2(np.sin(data).mean(0), np.cos(data).mean(0))
+    r  = wrap_angles(data - mu)
+    C  = np.atleast_2d(np.cov(r.T)) + 1e-6 * np.eye(data.shape[1])
+    return mu, C
+ 
+ 
+# ---------------------------------------------------------------- MWS (yours)
+def _mws_min_density(alpha, mu, sigma, K):
+    """Smallest value of the truncated Fourier density (should be >= 0)."""
+    g = np.linspace(-np.pi, np.pi, 4001)[:-1]
+    k = np.arange(-K, K + 1)
+    worst = np.inf
+    for j in range(len(mu)):
+        phi  = np.exp(-np.abs(sigma[j] * k) ** alpha)
+        dens = (phi[None, :] * np.cos(np.outer(g - mu[j], k))).sum(1) / TWO_PI
+        worst = min(worst, dens.min())
+    return float(worst)
+ 
+ 
+def _fit_mws_ind(data):
+    """Your MWS, refitted with K_CMP Fourier terms so that the density is accurate."""
+    d = data.shape[1]
+    res = fit_mws(data, K=K_CMP)
+    alpha, mu, sigma = mws_params(res, d)
+    note = f"alpha={alpha:.3f}"
+    mn = _mws_min_density(alpha, mu, sigma, K_CMP)
+    if mn < -1e-6:
+        note += f"; WARNING truncated Fourier density negative ({mn:.1e}) -> raise K_CMP"
+    # diagnostic: what the K_TRUNC fit of your script gives when judged with an accurate density
+    res10 = fit_mws(data)                                   # your default truncation
+    ll10_claimed  = -res10.fun
+    ll10_accurate = mws_loglik(res10.x, data, K_CMP)
+    note += (f"; K_TRUNC={K_TRUNC} fit: claimed logL={ll10_claimed:.1f}, "
+             f"accurate logL={ll10_accurate:.1f}")
+    return -res.fun, 1 + 2 * d, note
+ 
+ 
+# ---------------------------------------------------------------- MWN-ind
+def _wn_logpdf(x, mu, s):
+    """wrapped normal log-density, std s (before wrapping)"""
+    x = np.asarray(x, float)
+    if s < 1.5:
+        m  = np.arange(-3, 4)
+        z  = (x[:, None] - mu + TWO_PI * m[None, :]) / s
+        return logsumexp(-0.5 * z ** 2, axis=1) - np.log(s * np.sqrt(TWO_PI))
+    k    = np.arange(1, 21)
+    dens = (1 + 2 * (np.exp(-0.5 * (k * s) ** 2)[None, :]
+                     * np.cos(np.outer(x - mu, k))).sum(1)) / TWO_PI
+    return np.log(np.clip(dens, 1e-300, None))
+ 
+ 
+def _fit_mwn_ind(data):
+    n, d = data.shape
+    ll = 0.0
+    for j in range(d):
+        x  = data[:, j]
+        m0 = np.arctan2(np.sin(x).mean(), np.cos(x).mean())
+        R  = max(float(np.abs(np.mean(np.exp(1j * x)))), 1e-3)
+        s0 = max(np.sqrt(-2 * np.log(min(R, 0.999))), 0.02)
+        f  = lambda q: -np.sum(_wn_logpdf(x, q[0], np.exp(q[1])))
+        r  = minimize(f, [m0, np.log(s0)], method="Nelder-Mead",
+                      options={"xatol": 1e-7, "fatol": 1e-9, "maxiter": 2000})
+        ll += -r.fun
+    return ll, 2 * d, ""
+ 
+ 
+# ---------------------------------------------------------------- MGvM-ind
+GVM_GRID = np.linspace(-np.pi, np.pi, 4096, endpoint=False)
+ 
+ 
+def _gvm1_logpdf(x, mu1, k1, mu2, k2):
+    lg   = k1 * np.cos(GVM_GRID - mu1) + k2 * np.cos(2 * (GVM_GRID - mu2))
+    logZ = logsumexp(lg) + np.log(TWO_PI / len(GVM_GRID))      # exact (periodic trapezoid)
+    return k1 * np.cos(x - mu1) + k2 * np.cos(2 * (x - mu2)) - logZ
+ 
+ 
+def _fit_gvm1(x):
+    """ML fit of one generalised von Mises (order 2); returns (logL, params)."""
+    m1 = np.arctan2(np.sin(x).mean(), np.cos(x).mean())
+    R1 = min(max(float(np.abs(np.mean(np.exp(1j * x)))), 1e-3), 0.99)
+    m2 = np.arctan2(np.sin(2 * x).mean(), np.cos(2 * x).mean()) / 2
+    R2 = min(max(float(np.abs(np.mean(np.exp(2j * x)))), 1e-3), 0.99)
+    k1 = max(R1 * (2 - R1 ** 2) / (1 - R1 ** 2), 0.1)
+    k2 = max(R2 * (2 - R2 ** 2) / (1 - R2 ** 2), 0.1)
+    starts = [(m1, k1, m1, 0.1), (m1, 0.5 * k1, m2, 0.5 * k2), (m1, 0.2, m2, k2),
+              (m1, k1, m1 + np.pi / 2, 0.5), (m1, 0.1, m2, 2 * k2)]
+    best = (-np.inf, None)
+    bnds = [(None, None), (-6, 5), (None, None), (-6, 5)]
+    for s in starts:
+        q0 = np.array([s[0], np.log(max(s[1], 1e-3)), s[2], np.log(max(s[3], 1e-3))])
+        f  = lambda q: -np.sum(_gvm1_logpdf(x, q[0], np.exp(q[1]), q[2], np.exp(q[3])))
+        try:
+            r = minimize(f, q0, method="L-BFGS-B", bounds=bnds)
+        except Exception:
+            continue
+        if -r.fun > best[0]:
+            best = (-r.fun, r.x)
+    return best
+ 
+ 
+def _fit_mgvm_ind(data):
+    n, d = data.shape
+    ll, par = 0.0, []
+    for j in range(d):
+        l, q = _fit_gvm1(data[:, j]); ll += l; par.append(q)
+    return ll, 4 * d, "", np.array(par)           # par[j] = (mu1, logk1, mu2, logk2)
+ 
+ 
+# ---------------------------------------------------------------- MWN-full
+def _shifts(d, max_nz):
+    """image shifts in {-1,0,1}^d with at most max_nz non-zero entries"""
+    out = [np.zeros(d)]
+    for m in range(1, min(max_nz, d) + 1):
+        for idx in itertools.combinations(range(d), m):
+            for sg in itertools.product([-1, 1], repeat=m):
+                v = np.zeros(d); v[list(idx)] = sg; out.append(v)
+    return np.array(out)
+ 
+ 
+def _wn_full_ll(p, data, S):
+    n, d = data.shape
+    mu = p[:d]
+    M  = np.zeros((d, d)); M[np.tril_indices(d)] = p[d:]
+    L  = np.tril(M, -1) + np.diag(np.exp(np.diag(M)))
+    r0 = wrap_angles(data - mu)
+    X  = r0[:, None, :] + TWO_PI * S[None, :, :]                 # (n, S, d)
+    Linv = solve_triangular(L, np.eye(d), lower=True)
+    q  = ((X @ Linv.T) ** 2).sum(-1)
+    return (logsumexp(-0.5 * q, axis=1) - 0.5 * d * np.log(TWO_PI)
+            - np.log(np.diag(L)).sum())
+ 
+ 
+def _fit_mwn_full(data):
+    n, d = data.shape
+    mu0, C = _cmp_circ_init(data)
+    Lc = np.linalg.cholesky(C); M = Lc.copy()
+    M[np.diag_indices(d)] = np.log(np.diag(Lc))
+    p0 = np.concatenate([mu0, M[np.tril_indices(d)]])
+    S2 = _shifts(d, 2)
+    f  = lambda p: -np.sum(_wn_full_ll(p, data, S2))
+    r  = minimize(f, p0, method="L-BFGS-B", options={"maxiter": 300})
+    S3 = _shifts(d, 3)                                         # accuracy check
+    ll_acc = float(np.sum(_wn_full_ll(r.x, data, S3)))
+    return ll_acc, d + d * (d + 1) // 2, f"images: <=2 flips for fit, <=3 for reported logL (diff {ll_acc + r.fun:.2e})"
+ 
+ 
+# ---------------------------------------------------------------- MGvM-full
+def _g_unpack(p, d):
+    mu, k1, mu2, k2 = p[:d], np.exp(p[d:2*d]), p[2*d:3*d], np.exp(p[3*d:4*d])
+    Lam = np.zeros((d, d)); Lam[np.triu_indices(d, 1)] = p[4*d:]; Lam = Lam + Lam.T
+    return mu, k1, mu2, k2, Lam
+ 
+ 
+def _g_ft(p, th, d):
+    mu, k1, mu2, k2, Lam = _g_unpack(p, d)
+    x = th - mu; s = np.sin(x)
+    return np.cos(x) @ k1 + 0.5 * np.einsum("ni,ij,nj->n", s, Lam, s) + np.cos(2 * (th - mu2)) @ k2
+ 
+ 
+def _g_grad(p, th, w, d):
+    """gradient of sum_i w_i * ftilde(theta_i; p)"""
+    mu, k1, mu2, k2, Lam = _g_unpack(p, d)
+    x = th - mu; s = np.sin(x); cx = np.cos(x); Ls = s @ Lam; y = 2 * (th - mu2)
+    iu = np.triu_indices(d, 1)
+    return np.concatenate([
+        (w[:, None] * (k1 * s - cx * Ls)).sum(0),
+        (w[:, None] * (k1 * cx)).sum(0),
+        (w[:, None] * (2 * k2 * np.sin(y))).sum(0),
+        (w[:, None] * (k2 * np.cos(y))).sum(0),
+        (w[:, None] * s[:, iu[0]] * s[:, iu[1]]).sum(0)])
+ 
+ 
+def _g_prop(d, data, N, seed, ngrid=256, infl=2.0):
+    """Quadrature (d=2: uniform grid) or importance-sampling points (d>2) on the torus."""
+    if d == 2:
+        g = np.linspace(0, TWO_PI, ngrid, endpoint=False)
+        G = np.stack(np.meshgrid(g, g, indexing="ij"), -1).reshape(-1, 2)
+        return G, np.full(len(G), -d * np.log(TWO_PI)), 0.0
+    mu, C = _cmp_circ_init(data)
+    R = np.linalg.cholesky(infl * C).T                        # cov = R^T R
+    Z = np.random.default_rng(seed).standard_normal((N, d))
+    D = Z @ R
+    frac_out = float(np.mean((np.abs(D) > np.pi).any(1)))      # proposal mass outside one period
+    x = mu + D
+    logq = -0.5 * (Z ** 2).sum(1) - 0.5 * d * np.log(TWO_PI) - np.log(np.diag(R)).sum()
+    return x, logq, frac_out
+ 
+ 
+def _fit_mgvm_full(data, marg):
+    """MGvM with sine coupling. Two starting points are tried (independent-GvM start and
+    Gaussian-precision start); for d > 2 a fit is reported only if its importance-sampling
+    effective sample size is >= CMP_MIN_ESS, otherwise it is declared unreliable (NaN)."""
+    n, d = data.shape
+    k_par = 4 * d + d * (d - 1) // 2
+    x, logq, frac_out = _g_prop(d, data, CMP_NFIT, 1, ngrid=96)
+    if frac_out > 0.01:
+        return np.nan, k_par, \
+            f"skipped: data too spread for importance sampling ({100*frac_out:.0f}% of proposal outside one period)"
+    npair = d * (d - 1) // 2
+    bnds = ([(None, None)] * d + [(-8, 6)] * d + [(None, None)] * d + [(-8, 6)] * d
+            + [(None, None)] * npair)
+    wd = np.full(n, 1.0 / n)
+    # start A: independent GvM marginals, no coupling
+    pA = np.concatenate([marg[:, 0], marg[:, 1], marg[:, 2], marg[:, 3], np.zeros(npair)])
+    # start B: Gaussian approximation  (kappa_j ~ P_jj, lambda_jk ~ -P_jk)
+    mu0, C = _cmp_circ_init(data); P = np.linalg.inv(C)
+    pB = np.concatenate([mu0, np.log(np.clip(np.diag(P), 0.3, 300)), mu0, np.full(d, -3.0),
+                         -P[np.triu_indices(d, 1)]])
+ 
+    def fun(p):
+        f   = _g_ft(p, x, d) - logq
+        lse = logsumexp(f); wq = np.exp(f - lse)
+        val = -np.mean(_g_ft(p, data, d)) + lse - np.log(len(f))
+        g   = -_g_grad(p, data, wd, d) + _g_grad(p, x, wq, d)
+        return val, g
+ 
+    def finish(pfit):
+        if d == 2:
+            xf, lq, _ = _g_prop(2, data, 0, 0, ngrid=256)
+            a = _g_ft(pfit, xf, d) - lq; ess = 1.0
+        else:
+            parts = []
+            for c in range(max(1, CMP_NFINAL // 250_000)):
+                xx, ll_, _ = _g_prop(d, data, 250_000, 100 + c)
+                parts.append(_g_ft(pfit, xx, d) - ll_)
+            a = np.concatenate(parts)
+            w = np.exp(a - a.max()); ess = float(w.sum() ** 2 / (w ** 2).sum() / len(w))
+        logZ = logsumexp(a) - np.log(len(a))
+        return float(np.sum(_g_ft(pfit, data, d)) - n * logZ), ess
+ 
+    best, ess_seen = None, []
+    for tag, p0, mi in (("B", pB, 400), ("A", pA, CMP_MAXITER)):
+        r = minimize(fun, p0, jac=True, method="L-BFGS-B", bounds=bnds,
+                     options={"maxiter": mi, "ftol": 1e-12, "gtol": 1e-8})
+        ll, ess = finish(r.x); ess_seen.append(ess)
+        if (d == 2 or ess >= CMP_MIN_ESS) and (best is None or ll > best[0]):
+            best = (ll, ess, tag)
+        if d > 2 and best is not None:
+            break                      # first start that passes the ESS check is enough
+    if best is None:
+        return np.nan, k_par, (f"skipped: importance sampling unreliable "
+                               f"(ESS={100*max(ess_seen):.2f}% < {100*CMP_MIN_ESS:.0f}%)")
+    note = f"IS ESS={100*best[1]:.1f}% of draws; start {best[2]}" if d > 2 else f"grid quadrature; start {best[2]}"
+    return best[0], k_par, note
+ 
+ 
+# ---------------------------------------------------------------- driver
+def compare_models(data, label="data"):
+    """Fit every model on `data` (n x d, radians) and return an AIC/BIC table."""
+    n, d = data.shape
+    rows = []
+ 
+    def add(name, kind, fn):
+        t0 = time.time()
+        try:
+            out = fn()
+            ll, k, note = out[0], out[1], out[2]
+        except Exception as e:                       # never let one model stop the run
+            ll, k, note, out = np.nan, np.nan, f"failed: {e}", None
+        rows.append(dict(Model=name, Type=kind, k=k, LogLik=ll, Time_s=time.time() - t0, Note=note))
+        print(f"    {label:<16s} {name:<10s} k={k}  logL={ll:.2f}  ({time.time()-t0:.1f}s)  {note}")
+        return out
+ 
+    print(f"\n  >>> {label}: n={n}, d={d}")
+    add("von Mises", "independent", lambda: (fit_vonmises(data)[2], 2 * d, "moment/approximate ML"))
+    add("Wr. Cauchy", "independent", lambda: (fit_wrapped_cauchy(data)[2], 2 * d, "moment estimate"))
+    add("MWN-ind",    "independent", lambda: _fit_mwn_ind(data))
+    add("MWS-ind",    "independent", lambda: _fit_mws_ind(data))
+    mg = add("MGvM-ind",  "independent", lambda: _fit_mgvm_ind(data))
+    add("MWN-full",   "dependent",   lambda: _fit_mwn_full(data))
+    if mg is not None and len(mg) == 4:
+        add("MGvM-full", "dependent", lambda: _fit_mgvm_full(data, mg[3]))
+    return _finish_table(pd.DataFrame(rows), n)
+ 
+ 
+def _finish_table(df, n):
+    df["AIC"]  = 2 * df["k"] - 2 * df["LogLik"]
+    df["BIC"]  = df["k"] * np.log(n) - 2 * df["LogLik"]
+    df["dAIC"] = df["AIC"] - df["AIC"].min()
+    df["dBIC"] = df["BIC"] - df["BIC"].min()
+    return df[["Model", "Type", "k", "LogLik", "AIC", "BIC", "dAIC", "dBIC", "Time_s", "Note"]]
+ 
+ 
+def compare_classwise(data, labels, name="RNA"):
+    """Labelled mixture: fit each class separately, add log-likelihoods and parameters,
+    plus the mixing proportions (n_c/N) and C-1 extra parameters, identical for all models."""
+    N = len(data); classes = sorted(np.unique(labels))
+    per = [compare_models(data[labels == c], f"{name} class {c}") for c in classes]
+    base = per[0][["Model", "Type"]].copy()
+    ll = np.sum([p["LogLik"].values for p in per], axis=0)
+    k  = np.sum([p["k"].values for p in per], axis=0)
+    ll = ll + sum((labels == c).sum() * np.log((labels == c).mean()) for c in classes)
+    k  = k + (len(classes) - 1)
+    base["k"] = k; base["LogLik"] = ll
+    base["Time_s"] = np.sum([p["Time_s"].values for p in per], axis=0)
+    base["Note"] = [("; ".join(sorted({str(p["Note"].iloc[i]) for p in per
+                                       if str(p["Note"].iloc[i]).startswith("skipped")}))
+                     or "") for i in range(len(base))]
+    return _finish_table(base, N)
+ 
+ 
+def plot_model_comparison(df, title, fname):
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.8), facecolor=BG)
+    fig.suptitle(title, fontsize=12, fontweight="bold")
+    cols = plt.cm.tab10(np.arange(len(df)) % 10)
+    for ax, key in zip(axes, ["AIC", "BIC"]):
+        ax.set_facecolor("white")
+        vals = df[key].values.astype(float)
+        bars = ax.bar(df["Model"], np.nan_to_num(vals), color=cols, alpha=0.85, edgecolor="k", lw=0.5)
+        if np.isfinite(vals).any():
+            bars[int(np.nanargmin(vals))].set_edgecolor("#16a34a"); bars[int(np.nanargmin(vals))].set_linewidth(3)
+        for b, v in zip(bars, vals):
+            ax.text(b.get_x() + b.get_width() / 2, b.get_height(),
+                    "n/a" if not np.isfinite(v) else f"{v:.0f}", ha="center",
+                    va="bottom" if (np.isfinite(v) and v >= 0) else "top", fontsize=7)
+        ax.set_title(f"{key}  (lower is better; green = best)", fontsize=10)
+        ax.tick_params(axis="x", rotation=40, labelsize=8)
+        ax.spines[["top", "right"]].set_visible(False)
+    plt.tight_layout()
+    _save(fig, fname)
+ 
+ 
+def run_model_comparison():
+    print("\n" + "=" * 70)
+    print("  SECTION 21 — MODEL COMPARISON (logL / AIC / BIC)")
+    print("=" * 70)
+    protein          = load_protein(PROTEIN_FILE)
+    rna, true_labels = load_rna(RNA_FILE)
+ 
+    tables = {
+        "Protein (single component)":     compare_models(protein, "Protein"),
+        "RNA (single component, pooled)": compare_models(rna, "RNA pooled"),
+        "RNA (labelled 3-class mixture)": compare_classwise(rna, true_labels, "RNA"),
+    }
+    pd.set_option("display.width", 200); pd.set_option("display.max_colwidth", 60)
+    allrows = []
+    for i, (name, df) in enumerate(tables.items()):
+        print("\n" + "-" * 70 + f"\n  {name}\n" + "-" * 70)
+        print(df.drop(columns=["Note"]).round(2).to_string(index=False))
+        notes = df[df["Note"].astype(str).str.startswith("skipped")]
+        for _, r in notes.iterrows():
+            print(f"  note: {r['Model']} {r['Note']}")
+        tag = ["protein", "rna_pooled", "rna_classwise"][i]
+        df.to_csv(os.path.join(OUTPUT_DIR, f"model_comparison_{tag}.csv"), index=False)
+        plot_model_comparison(df, name, f"model_comparison_{tag}.png")
+        allrows.append(df.assign(Dataset=name))
+    pd.concat(allrows).to_csv(os.path.join(OUTPUT_DIR, "model_comparison_all.csv"), index=False)
+    print("\n  Saved model_comparison_*.csv / *.png to", OUTPUT_DIR)
+    return tables
+ 
+ 
+ 
+ 
+ 
+ 
+if __name__ == "__main__":
+    run_model_comparison()
+ 
 
